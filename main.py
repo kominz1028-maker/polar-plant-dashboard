@@ -4,10 +4,11 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from pathlib import Path  # 표준 라이브러리 (requirements.txt 불필요)
+from pathlib import Path  # 표준 라이브러리(requirements.txt 불필요)
+import unicodedata        # ✅ 한글 유니코드 정규화(NFC/NFD) 처리용
 
 # =========================
-# 0) 페이지 설정 / 상수
+# 0) 페이지 기본 설정
 # =========================
 st.set_page_config(layout="wide", page_title="극지식물 EC 연구")
 
@@ -21,8 +22,10 @@ school_colors = {
     "동산고": "#E74C3C",
 }
 
+# Plotly 한글 폰트(가능한 후보 여러 개)
 PLOTLY_FONT_FAMILY = "Malgun Gothic, Apple SD Gothic Neo, NanumGothic, Noto Sans CJK KR, sans-serif"
 
+# Streamlit 텍스트도 한글 폰트 적용
 st.markdown(
     f"""
     <style>
@@ -34,18 +37,19 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# 제목
 st.title("🌱 극지식물 최적 EC 농도 연구")
 st.subheader("송도고·하늘고·아라고·동산고 공동 실험")
 
 
 # =========================
-# 1) 경로 자동 탐지 (Cloud에서 핵심)
+# 1) 경로 자동 탐지 (Cloud에서도 안전)
 # =========================
 def get_data_dir() -> Path:
     """
     data 폴더 위치가 환경에 따라 달라질 수 있어 2군데를 확인:
     1) 현재 작업 폴더(cwd)/data
-    2) main.py가 있는 폴더/ data
+    2) main.py가 있는 폴더/data
     """
     candidates = [
         Path.cwd() / "data",
@@ -54,7 +58,6 @@ def get_data_dir() -> Path:
     for c in candidates:
         if c.exists() and c.is_dir():
             return c
-    # 둘 다 없으면, 그래도 반환(디버그로 확인)
     return candidates[0]
 
 
@@ -65,32 +68,52 @@ DATA_DIR = get_data_dir()
 # 2) 유틸 함수
 # =========================
 def set_plotly_korean(fig):
+    """Plotly 그래프 한글 깨짐 방지"""
     fig.update_layout(font=dict(family=PLOTLY_FONT_FAMILY))
     return fig
 
 
+def nfc(s: str) -> str:
+    """유니코드 NFC 정규화"""
+    return unicodedata.normalize("NFC", s)
+
+
+def nfd(s: str) -> str:
+    """유니코드 NFD 정규화"""
+    return unicodedata.normalize("NFD", s)
+
+
 def safe_read_csv(path: Path):
+    """
+    CSV를 utf-8-sig로 먼저 읽고, 실패하면 cp949로 재시도
+    """
     try:
         return pd.read_csv(path, encoding="utf-8-sig")
     except UnicodeDecodeError:
         try:
             return pd.read_csv(path, encoding="cp949")
         except Exception as e:
-            st.warning(f"⚠️ CSV 읽기 실패: {path}\n- 에러: {e}")
+            st.warning(f"⚠️ CSV 읽기 실패: {path.name}\n- 에러: {e}")
             return None
     except FileNotFoundError:
         return None
     except Exception as e:
-        st.warning(f"⚠️ CSV 읽기 실패: {path}\n- 에러: {e}")
+        st.warning(f"⚠️ CSV 읽기 실패: {path.name}\n- 에러: {e}")
         return None
 
 
 def try_parse_time(df: pd.DataFrame, school: str) -> pd.DataFrame:
+    """
+    time 컬럼을 datetime으로 변환 후 정렬
+    실패하면 경고 표시하고 원본 유지
+    """
     if df is None or df.empty:
         return df
+
     if "time" not in df.columns:
-        st.warning(f"⚠️ {school} 데이터에 'time' 컬럼이 없습니다.")
+        st.warning(f"⚠️ {school} 데이터에 'time' 컬럼이 없습니다. 시계열 분석이 제한됩니다.")
         return df
+
     try:
         df = df.copy()
         df["time"] = pd.to_datetime(df["time"])
@@ -102,10 +125,12 @@ def try_parse_time(df: pd.DataFrame, school: str) -> pd.DataFrame:
 
 
 def download_csv_bytes(df: pd.DataFrame) -> bytes:
+    """다운로드 버튼용 CSV bytes(utf-8-sig)"""
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
 def fmt_num(x, digits=2):
+    """숫자 예쁘게 표시 (None/NaN이면 N/A)"""
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return "N/A"
     try:
@@ -114,60 +139,110 @@ def fmt_num(x, digits=2):
         return "N/A"
 
 
-def find_first_file(patterns):
+def find_file_by_school_and_keyword(school: str, keyword: str, ext: str):
+    """
+    ✅ Cloud에서 한글 파일명이 NFD로 저장되는 문제 해결용
+    school/keyword/file 모두 NFC/NFD로 바꿔가며 포함 여부를 검사해서 파일을 찾는다.
+    """
     if not DATA_DIR.exists():
         return None
-    for pat in patterns:
-        cands = sorted(DATA_DIR.glob(pat), key=lambda p: p.name)
-        if cands:
-            return cands[0]
+
+    school_nfc, school_nfd = nfc(school), nfd(school)
+    keyword_nfc, keyword_nfd = nfc(keyword), nfd(keyword)
+
+    for p in sorted(DATA_DIR.iterdir(), key=lambda x: x.name):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() != ext.lower():
+            continue
+
+        name = p.name
+        name_nfc = nfc(name)
+        name_nfd = nfd(name)
+
+        ok_school = (
+            (school_nfc in name_nfc) or (school_nfd in name_nfd) or
+            (school_nfc in name_nfd) or (school_nfd in name_nfc)
+        )
+        ok_keyword = (
+            (keyword_nfc in name_nfc) or (keyword_nfd in name_nfd) or
+            (keyword_nfc in name_nfd) or (keyword_nfd in name_nfc)
+        )
+
+        if ok_school and ok_keyword:
+            return p
+
+    return None
+
+
+def find_growth_xlsx():
+    """
+    생육결과 엑셀은 학교명이 없으니
+    - xlsx 확장자
+    - '4개교' + '생육결과데이터' 포함 (NFC/NFD 모두 고려)
+    로 찾는다.
+    """
+    if not DATA_DIR.exists():
+        return None
+
+    for p in sorted(DATA_DIR.iterdir(), key=lambda x: x.name):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() != ".xlsx":
+            continue
+
+        name_nfc = nfc(p.name)
+        name_nfd = nfd(p.name)
+
+        has_4 = ("4개교" in name_nfc) or ("4개교" in name_nfd)
+        has_growth = ("생육결과데이터" in name_nfc) or ("생육결과데이터" in name_nfd)
+
+        if has_4 and has_growth:
+            return p
+
     return None
 
 
 @st.cache_data(show_spinner=False)
 def load_env_data_all():
+    """
+    4개 학교 환경데이터 로드 (NFC/NFD 문제 해결 버전)
+    """
     data = {}
     for school in SCHOOLS:
-        # 파일명 변화에 최대한 견고하게
-        patterns = [
-            f"{school}_환경데이터.csv",
-            f"*{school}*환경데이터*.csv",
-            f"*{school}*_환경데이터*.csv",
-        ]
-        path = find_first_file(patterns)
+        path = find_file_by_school_and_keyword(school, "환경데이터", ".csv")
         if path is None:
             data[school] = None
             continue
 
         df = safe_read_csv(path)
-        if df is None:
-            data[school] = None
-        else:
-            data[school] = try_parse_time(df, school)
+        data[school] = try_parse_time(df, school) if df is not None else None
+
     return data
 
 
 @st.cache_data(show_spinner=False)
 def load_growth_data():
-    patterns = [
-        "4개교_생육결과데이터.xlsx",
-        "*4개교*생육결과*.xlsx",
-        "*4개교*생육*데이터*.xlsx",
-    ]
-    path = find_first_file(patterns)
+    """
+    생육 결과 엑셀 로드 (학교 정보 없음 → 전체 통계만)
+    """
+    path = find_growth_xlsx()
     if path is None:
         return None
+
     try:
         return pd.read_excel(path, engine="openpyxl")
     except Exception as e:
-        st.warning(f"⚠️ 엑셀 읽기 실패: {path}\n- 에러: {e}")
+        st.warning(f"⚠️ 엑셀 읽기 실패: {path.name}\n- 에러: {e}")
         return None
 
 
 def env_means_by_school(env_dict: dict) -> pd.DataFrame:
+    """학교별 평균(temperature/humidity/ph/ec) 계산"""
     rows = []
     for school in SCHOOLS:
         df = env_dict.get(school)
+
         if df is None or df.empty:
             rows.append({"학교": school, "temperature": None, "humidity": None, "ph": None, "ec": None})
         else:
@@ -180,6 +255,7 @@ def env_means_by_school(env_dict: dict) -> pd.DataFrame:
                     "ec": df["ec"].mean() if "ec" in df.columns else None,
                 }
             )
+
     out = pd.DataFrame(rows)
     out["color"] = out["학교"].map(school_colors)
     out["target_ec"] = out["학교"].map(EC_TARGET)
@@ -187,6 +263,7 @@ def env_means_by_school(env_dict: dict) -> pd.DataFrame:
 
 
 def overall_env_stats(env_dict: dict) -> dict:
+    """전체(4개교 합산) 측정 횟수/평균 온도/평균 습도"""
     total_rows = 0
     temps, hums = [], []
 
@@ -194,6 +271,7 @@ def overall_env_stats(env_dict: dict) -> dict:
         df = env_dict.get(school)
         if df is None or df.empty:
             continue
+
         total_rows += len(df)
         if "temperature" in df.columns:
             temps.append(df["temperature"])
@@ -207,39 +285,15 @@ def overall_env_stats(env_dict: dict) -> dict:
 
 
 # =========================
-# 3) 디버그(Cloud에서 매우 중요)
-# =========================
-with st.sidebar:
-    with st.expander("🛠 디버그: 서버에서 보이는 파일 목록", expanded=False):
-        st.write("Path.cwd():", str(Path.cwd()))
-        st.write("__file__ dir:", str(Path(__file__).resolve().parent))
-        st.write("DATA_DIR:", str(DATA_DIR))
-        st.write("DATA_DIR exists?:", DATA_DIR.exists())
-        if DATA_DIR.exists():
-            st.write("data 폴더 파일들:")
-            st.write([p.name for p in sorted(DATA_DIR.iterdir(), key=lambda p: p.name)])
-        else:
-            st.warning("서버에서 data 폴더 자체를 못 찾고 있습니다.")
-
-
-# =========================
-# 4) 데이터 로딩
+# 3) 데이터 로딩
 # =========================
 with st.spinner("데이터 불러오는 중..."):
     env_data = load_env_data_all()
     growth_df = load_growth_data()
 
-# 에러 표시
-for school in SCHOOLS:
-    if env_data.get(school) is None:
-        st.error(f"❌ 파일을 찾을 수 없습니다: {school} 환경데이터 CSV (data 폴더 확인)")
-
-if growth_df is None:
-    st.error("❌ 파일을 찾을 수 없습니다: 4개교_생육결과데이터.xlsx (data 폴더 확인)")
-
 
 # =========================
-# 5) 사이드바 UI
+# 4) 사이드바
 # =========================
 with st.sidebar:
     st.markdown("## 📌 실험 정보")
@@ -250,48 +304,65 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("## 📌 학교별 EC 조건 (표)")
-    st.dataframe(
-        pd.DataFrame(
-            {"학교": ["송도고", "하늘고", "아라고", "동산고"], "EC": ["1", "2 (최적 예상)", "4", "8"]}
-        ),
-        use_container_width=True,
-        hide_index=True,
+    ec_table = pd.DataFrame(
+        {
+            "학교": ["송도고", "하늘고", "아라고", "동산고"],
+            "EC": ["1", "2 (최적 예상)", "4", "8"],
+        }
     )
+    st.dataframe(ec_table, use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.markdown("## 📌 학교 선택")
     selected_school = st.selectbox("분석할 학교를 선택하세요", ["전체"] + SCHOOLS, index=0)
 
+# 파일 누락 에러 처리(요구사항)
+for school in SCHOOLS:
+    if env_data.get(school) is None:
+        st.error(f"❌ 파일을 찾을 수 없습니다: {school} 환경데이터 CSV")
+
+if growth_df is None:
+    st.error("❌ 파일을 찾을 수 없습니다: 4개교_생육결과데이터.xlsx")
+
 
 # =========================
-# 6) 탭 3개
+# 5) 메인 화면 (탭 3개)
 # =========================
 tab1, tab2, tab3 = st.tabs(["🟢 실험 개요", "🟡 환경 데이터 분석", "🔵 생육 결과 분석"])
 
-# ---- Tab 1
+
+# ---------------------------------
+# Tab 1: 실험 개요
+# ---------------------------------
 with tab1:
     st.markdown(
         """
 ### 연구 배경
 극지식물은 낮은 온도, 제한된 영양 환경에서도 생존하는 특별한 식물입니다.  
-이번 실험은 **양액 농도(EC)** 가 생육에 어떤 영향을 주는지 알아보기 위해 진행했습니다.
+이번 실험은 **양액 농도(EC)** 가 극지식물 생육에 어떤 영향을 주는지 알아보기 위해 진행했습니다.
 
 ### 실험 방법
-1. 4개 학교가 같은 극지식물을 재배했습니다.
-2. 학교마다 EC 조건(1, 2, 4, 8)을 다르게 설정했습니다.
-3. 환경 센서로 온도/습도/pH/EC를 일정 간격으로 자동 측정했습니다.
-4. 실험 종료 후 개체별 잎 수/길이/생중량을 측정했습니다.
+1. 4개 학교가 **같은 극지식물**을 재배했습니다.
+2. 학교마다 **EC 조건(1, 2, 4, 8)** 을 다르게 설정했습니다.
+3. 환경 센서로 **온도/습도/pH/EC** 를 일정 간격으로 자동 측정했습니다.
+4. 실험 종료 후 개체별 **잎 수, 길이, 생중량** 등을 측정했습니다.
+
+👉 연구 질문: **극지식물 생육에 가장 적합한 EC 농도는 무엇일까?**
 """
     )
 
     stats = overall_env_stats(env_data)
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("총 측정 횟수", f"{stats['total_rows']:,}" if stats["total_rows"] is not None else "N/A")
     c2.metric("평균 온도", f"{fmt_num(stats['avg_temp'], 2)} °C")
     c3.metric("평균 습도", f"{fmt_num(stats['avg_hum'], 2)} %")
     c4.metric("전체 개체 수", "58")
 
-# ---- Tab 2
+
+# ---------------------------------
+# Tab 2: 환경 데이터 분석
+# ---------------------------------
 with tab2:
     st.markdown("### ✔ 학교별 평균 비교 (2x2 그래프)")
     means_df = env_means_by_school(env_data)
@@ -352,50 +423,64 @@ with tab2:
     st.markdown("### ✔ 선택한 학교 시계열")
 
     if selected_school == "전체":
-        st.info("ℹ️ 시계열 그래프는 학교 1개를 선택했을 때 보기 좋아요.")
+        st.info("ℹ️ 시계열 그래프는 **학교 1개를 선택**했을 때 더 이해하기 쉽습니다. (사이드바에서 선택)")
     else:
         df_sel = env_data.get(selected_school)
+
         if df_sel is None or df_sel.empty:
-            st.warning("⚠️ 선택한 학교 데이터가 없습니다.")
+            st.warning("⚠️ 선택한 학교의 환경 데이터가 비어있습니다.")
         else:
+            # 온도 변화
             if "temperature" in df_sel.columns and "time" in df_sel.columns:
-                f = px.line(df_sel, x="time", y="temperature", title=f"{selected_school} 온도 변화")
-                f.update_traces(line=dict(color=school_colors[selected_school]))
-                st.plotly_chart(set_plotly_korean(f), use_container_width=True)
+                fig_t = px.line(df_sel, x="time", y="temperature", title=f"{selected_school} 온도 변화")
+                fig_t.update_traces(line=dict(color=school_colors[selected_school]))
+                st.plotly_chart(set_plotly_korean(fig_t), use_container_width=True)
+            else:
+                st.warning("⚠️ temperature 또는 time 컬럼이 없어 온도 시계열을 그릴 수 없습니다.")
 
+            # 습도 변화
             if "humidity" in df_sel.columns and "time" in df_sel.columns:
-                f = px.line(df_sel, x="time", y="humidity", title=f"{selected_school} 습도 변화")
-                f.update_traces(line=dict(color=school_colors[selected_school]))
-                st.plotly_chart(set_plotly_korean(f), use_container_width=True)
+                fig_h = px.line(df_sel, x="time", y="humidity", title=f"{selected_school} 습도 변화")
+                fig_h.update_traces(line=dict(color=school_colors[selected_school]))
+                st.plotly_chart(set_plotly_korean(fig_h), use_container_width=True)
+            else:
+                st.warning("⚠️ humidity 또는 time 컬럼이 없어 습도 시계열을 그릴 수 없습니다.")
 
+            # EC 변화 + 목표 EC 기준선
             if "ec" in df_sel.columns and "time" in df_sel.columns:
-                f = go.Figure()
-                f.add_trace(
+                fig_ec = go.Figure()
+                fig_ec.add_trace(
                     go.Scatter(
                         x=df_sel["time"],
                         y=df_sel["ec"],
                         mode="lines",
                         name="측정 EC",
                         line=dict(color=school_colors[selected_school]),
+                        hovertemplate="시간=%{x}<br>EC=%{y:.2f}<extra></extra>",
                     )
                 )
-                f.add_hline(
+                fig_ec.add_hline(
                     y=EC_TARGET[selected_school],
                     line_dash="dash",
                     annotation_text=f"목표 EC = {EC_TARGET[selected_school]}",
                     annotation_position="top left",
                 )
-                f.update_layout(title=f"{selected_school} EC 변화 (목표 EC 기준선 포함)")
-                st.plotly_chart(set_plotly_korean(f), use_container_width=True)
+                fig_ec.update_layout(title=f"{selected_school} EC 변화 (목표 EC 기준선 포함)")
+                st.plotly_chart(set_plotly_korean(fig_ec), use_container_width=True)
+            else:
+                st.warning("⚠️ ec 또는 time 컬럼이 없어 EC 시계열을 그릴 수 없습니다.")
 
     st.markdown("---")
     st.markdown("### ✔ 원본 데이터")
+
     if selected_school == "전체":
-        st.info("ℹ️ 원본 테이블/다운로드는 학교를 선택했을 때 제공합니다.")
+        st.info("ℹ️ 원본 데이터 표/다운로드는 **학교를 선택**했을 때 제공합니다.")
     else:
         df_sel = env_data.get(selected_school)
         if df_sel is None:
             st.error(f"❌ 파일을 찾을 수 없습니다: {selected_school} 환경데이터 CSV")
+        elif df_sel.empty:
+            st.warning("⚠️ 데이터가 비어있습니다.")
         else:
             with st.expander("원본 데이터 미리보기 (처음 100행)"):
                 st.dataframe(df_sel.head(100), use_container_width=True)
@@ -407,7 +492,10 @@ with tab2:
                 mime="text/csv",
             )
 
-# ---- Tab 3
+
+# ---------------------------------
+# Tab 3: 생육 결과 분석
+# ---------------------------------
 with tab3:
     st.warning("⚠️ 이 데이터는 4개 학교의 개체가 합쳐진 데이터입니다.\n학교별 비교는 불가능합니다.")
 
@@ -450,8 +538,8 @@ with tab3:
             s = pd.to_numeric(growth_df[colname], errors="coerce").dropna()
             if s.empty:
                 return None
-            f = px.histogram(pd.DataFrame({colname: s}), x=colname, nbins=15, title=title)
-            return set_plotly_korean(f)
+            fig = px.histogram(pd.DataFrame({colname: s}), x=colname, nbins=15, title=title)
+            return set_plotly_korean(fig)
 
         figs = [
             draw_hist("생중량(g)", "생중량 히스토그램"),
@@ -459,12 +547,12 @@ with tab3:
             draw_hist("지상부 길이(mm)", "지상부 길이 히스토그램"),
         ]
 
-        for i, f in enumerate(figs):
+        for i, figx in enumerate(figs):
             with cols[i]:
-                if f is None:
+                if figx is None:
                     st.info("표시할 데이터가 없어요.")
                 else:
-                    st.plotly_chart(f, use_container_width=True)
+                    st.plotly_chart(figx, use_container_width=True)
 
         st.markdown("---")
         st.markdown("### ✔ 상관관계 (선택)")
@@ -476,8 +564,11 @@ with tab3:
 
         if options:
             choice = st.selectbox("보고 싶은 관계를 선택하세요", options)
-            x_col = "잎 수(장)" if "잎 수" in choice else "지상부 길이(mm)"
-            y_col = "생중량(g)"
+
+            if choice == "잎 수 vs 생중량":
+                x_col, y_col = "잎 수(장)", "생중량(g)"
+            else:
+                x_col, y_col = "지상부 길이(mm)", "생중량(g)"
 
             tmp = growth_df[[x_col, y_col]].copy()
             tmp[x_col] = pd.to_numeric(tmp[x_col], errors="coerce")
@@ -487,11 +578,14 @@ with tab3:
             if tmp.empty:
                 st.info("표시할 데이터가 없어요.")
             else:
-                f = px.scatter(tmp, x=x_col, y=y_col, title=f"{choice} 산점도")
-                st.plotly_chart(set_plotly_korean(f), use_container_width=True)
+                fig_sc = px.scatter(tmp, x=x_col, y=y_col, title=f"{choice} 산점도")
+                st.plotly_chart(set_plotly_korean(fig_sc), use_container_width=True)
         else:
             st.info("상관관계 그래프를 그리기 위한 컬럼이 부족합니다.")
 
 
+# =========================
+# 6) 푸터
+# =========================
 st.markdown("---")
 st.markdown("Made with ❤️ by 극지식물 연구팀 | Powered by Streamlit")
